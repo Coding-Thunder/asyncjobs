@@ -1,0 +1,12 @@
+node_modules/
+.next/
+.swc/
+.env
+.env.local
+*.log
+.DS_Store
+
+# Playwright
+test-results/
+playwright-report/
+

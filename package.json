@@ -1,0 +1,27 @@
+{
+  "name": "asyncops",
+  "private": true,
+  "version": "1.0.0",
+  "description": "AsyncOps — hosted job orchestration for async workflows.",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "internal/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c cyan,green \"npm run dev -w @asyncops/api\" \"npm run dev -w @asyncops/web\"",
+    "dev:api": "npm run dev -w @asyncops/api",
+    "dev:web": "npm run dev -w @asyncops/web",
+    "build:web": "npm run build -w @asyncops/web",
+    "test": "npm test -w @asyncops/api && npm test -w @asyncops/web",
+    "test:api": "npm test -w @asyncops/api",
+    "test:web": "npm test -w @asyncops/web",
+    "test:e2e": "npm test -w @asyncops/e2e",
+    "test:e2e:api": "npm run test:api -w @asyncops/e2e",
+    "test:e2e:ui": "npm run test:ui -w @asyncops/e2e",
+    "mcp": "node internal/mcp/index.js"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

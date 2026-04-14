@@ -1,0 +1,15 @@
+{
+  "name": "@asyncops/e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright end-to-end smoke tests against a running AsyncOps API and dashboard.",
+  "scripts": {
+    "test": "playwright test",
+    "test:api": "playwright test --project=api-smoke",
+    "test:ui": "playwright test --project=ui-smoke"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "playwright": "^1.59.1"
+  }
+}
