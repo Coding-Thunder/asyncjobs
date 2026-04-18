@@ -98,7 +98,7 @@ router.post('/jobs/:id/retry', async (req, res, next) => {
     if (!oid) return res.status(400).json({ error: 'invalid job id' });
 
     const idStr = oid.toString();
-    const { jobs } = await getCollections();
+    const { users, jobs } = await getCollections();
 
     const now = new Date();
     const adminLog = {
@@ -107,26 +107,48 @@ router.post('/jobs/:id/retry', async (req, res, next) => {
       timestamp: now,
     };
 
-    const result = await jobs.updateOne(
-      { _id: oid },
+    const existing = await jobs.findOne({ _id: oid }, { projection: { userId: 1 } });
+    if (!existing) return res.status(404).json({ error: 'not found' });
+
+    const updated = await jobs.findOneAndUpdate(
+      { _id: oid, status: { $in: ['failed', 'completed'] } },
       {
         $set: {
           status: 'pending',
           error: null,
           result: null,
+          attempts: 0,
           updatedAt: now,
         },
         $push: { logs: { $each: [adminLog], $slice: -500 } },
-      }
+      },
+      { returnDocument: 'after' }
     );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'not found' });
+    const doc = updated && (updated.value || updated);
+    if (!doc || !doc._id) {
+      const current = await jobs.findOne({ _id: oid }, { projection: { status: 1 } });
+      return res.status(409).json({
+        error: 'job_not_retriable',
+        status: current ? current.status : null,
+      });
     }
+
+    // Admin retry still counts against the owner's monthly plan.
+    await users.updateOne(
+      { _id: existing.userId },
+      { $inc: { jobCountMonthly: 1 } }
+    );
 
     publishEvent(idStr, {
       type: 'status',
-      data: { status: 'pending', error: null, result: null, updatedAt: now },
+      data: {
+        status: 'pending',
+        error: null,
+        result: null,
+        attempts: 0,
+        updatedAt: now,
+      },
     });
     publishEvent(idStr, { type: 'log', data: adminLog });
 

@@ -26,14 +26,14 @@ export const siteConfig = {
   },
 
   dashboardPreview: {
-    url: 'app.asyncops.dev/dashboard/jobs',
+    url: 'app.asyncops.com/dashboard/jobs',
     sidebar: [
       { label: 'jobs', active: true },
       { label: 'api-keys' },
       { label: 'docs' },
     ],
     stats: [
-      { label: '1,284', sub: 'completed', color: 'emerald' },
+      { label: '847', sub: 'completed', color: 'emerald' },
       { label: '12', sub: 'failed', color: 'rose' },
       { label: '3', sub: 'processing', color: 'sky' },
     ],

@@ -1,9 +1,10 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, useEffect, useMemo } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { apiFetch, saveAuth } from '../../lib/api';
+import { sanitizeNextPath } from '../../lib/nextPath';
 import {
   TerminalAuthLayout,
   TerminalField,
@@ -21,6 +22,15 @@ const BOOT_LINES = [
 
 export default function LoginPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const nextPath = useMemo(
+    () => sanitizeNextPath(searchParams.get('next')) || '/dashboard/jobs',
+    [searchParams]
+  );
+  const signupHref = useMemo(() => {
+    const sanitized = sanitizeNextPath(searchParams.get('next'));
+    return sanitized ? `/signup?next=${encodeURIComponent(sanitized)}` : '/signup';
+  }, [searchParams]);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [err, setErr] = useState('');
@@ -52,7 +62,7 @@ export default function LoginPage() {
       });
       saveAuth(data.token, data.user);
       setOk('session authenticated. redirecting...');
-      setTimeout(() => router.push('/dashboard/jobs'), 650);
+      setTimeout(() => router.push(nextPath), 650);
     } catch (e2) {
       setErr(e2.message || 'invalid credentials');
       setLoading(false);

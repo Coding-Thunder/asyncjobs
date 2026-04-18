@@ -106,15 +106,14 @@ All user-facing guides live in [docs/](docs/):
 
 ## Repository layout
 
-AsyncOps is a small monorepo. If you are only **using** AsyncOps, the SDK in `packages/sdk` is the only part you ever need.
+AsyncOps is a small monorepo. If you are only **using** AsyncOps, the SDK in `sdk/` is the only part you ever need.
 
 ```
 apps/
   api/        backend service (Express + MongoDB + BullMQ)
   web/        dashboard front-end (Next.js)
 
-packages/
-  sdk/        client SDK — published as `asyncops-sdk`
+sdk/          client SDK — published as `asyncops-sdk`
 
 internal/
   e2e/        Playwright end-to-end smoke tests

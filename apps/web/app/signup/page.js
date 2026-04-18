@@ -1,9 +1,10 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { useRouter } from 'next/navigation';
+import { useState, useEffect, useMemo } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { apiFetch } from '../../lib/api';
+import { sanitizeNextPath } from '../../lib/nextPath';
 import {
   TerminalAuthLayout,
   TerminalField,
@@ -21,6 +22,14 @@ const BOOT_LINES = [
 
 export default function SignupPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const nextPath = useMemo(
+    () => sanitizeNextPath(searchParams.get('next')),
+    [searchParams]
+  );
+  const loginHref = nextPath
+    ? `/login?next=${encodeURIComponent(nextPath)}`
+    : '/login';
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [err, setErr] = useState('');
@@ -55,7 +64,7 @@ export default function SignupPage() {
         body: JSON.stringify({ email, password }),
       });
       setOk('account created. redirecting to login...');
-      setTimeout(() => router.push('/login'), 650);
+      setTimeout(() => router.push(loginHref), 650);
     } catch (e2) {
       setErr(e2.message || 'signup failed');
       setLoading(false);
@@ -129,7 +138,7 @@ export default function SignupPage() {
           <span className="text-zinc-600"># </span>
           already registered?{' '}
           <Link
-            href="/login"
+            href={loginHref}
             className="text-sky-400 hover:text-sky-300 underline decoration-dotted underline-offset-4"
           >
             login --existing

@@ -5,8 +5,8 @@
   "description": "AsyncOps — hosted job orchestration for async workflows.",
   "workspaces": [
     "apps/*",
-    "packages/*",
-    "internal/*"
+    "internal/*",
+    "sdk"
   ],
   "scripts": {
     "dev": "concurrently -n api,web -c cyan,green \"npm run dev -w @asyncops/api\" \"npm run dev -w @asyncops/web\"",

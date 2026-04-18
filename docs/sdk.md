@@ -108,14 +108,17 @@ const { id } = await client.createJob({
 - `401 invalid API key` — key was revoked, never existed, or was copy-pasted wrong.
 - `400 request body is required` — SDK missed a JSON body (you shouldn't hit this using the SDK; only via raw REST).
 
-#### `listJobs() → { jobs: [...] }`
+#### `listJobs({ limit?, cursor? }) → { jobs: [...], nextCursor }`
 
 ```js
-const { jobs } = await client.listJobs();
+const { jobs, nextCursor } = await client.listJobs();
 // jobs: [{ id, type, status, attempts, createdAt, updatedAt }, ...]
+
+// later: paginate older
+const more = await client.listJobs({ cursor: nextCursor });
 ```
 
-Returns the newest 200 jobs for the authenticated account, newest first. No pagination — if you need more than 200, filter on your side by time and use idempotency to chunk.
+Paginated, newest first. `limit` defaults to 50 and clamps to `[1, 100]`. `nextCursor` is an opaque string; pass it back verbatim to fetch the next (older) page. When there are no more rows, `nextCursor` is `null`.
 
 Note: the list response projects down to the listed fields only. Use `getJob(id)` for the full document (data, result, error, logs).
 
@@ -131,9 +134,11 @@ const { job, logs } = await client.getJob(id);
 
 #### `retryJob(id) → { id, status: 'pending' }`
 
-Re-queues any job — `pending`, `processing`, `completed`, or `failed`. The API clears `result` and `error`, sets status back to `pending`, appends a `"Job retry requested"` log line, and re-enqueues in BullMQ.
+Re-queues a job whose status is **`failed` or `completed`**. The API clears `result` and `error`, resets `attempts` to `0`, sets status back to `pending`, appends a `"Job retry requested"` log line, and re-enqueues in BullMQ. Retries count against the monthly plan cap, exactly like `createJob`.
 
-> **Warning — do not retry a job that is currently `processing`.** You will create a race between the in-flight handler and the new claim. Retry only jobs that are `completed` or `failed`.
+If the job is in any other status (`pending` or `processing`), the API rejects with `409 { error: "job_not_retriable", status: "<current>" }`. The SDK surfaces this as a thrown error — inspect `err.status === 409` and `err.data.status` to see what the server thinks the current state is (useful when your local view is stale). Do not retry looping on 409; fetch fresh state with `getJob` instead.
+
+> The attempts reset is deliberate. A retry is a fresh attempt budget, not a continuation — BullMQ gets the full `MAX_JOB_ATTEMPTS` window again. Callers that want "resume, don't start over" semantics should use a new job with an idempotency key, not `retryJob`.
 
 ### Realtime subscription
 

@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { apiFetch, subscribeJob } from '../../../../lib/api';
@@ -15,6 +15,7 @@ export default function JobDetailPage() {
   const [err, setErr] = useState('');
   const [tab, setTab] = useState('Data');
   const [retrying, setRetrying] = useState(false);
+  const streamRef = useRef(null);
 
   const load = useCallback(async () => {
     try {
@@ -29,12 +30,11 @@ export default function JobDetailPage() {
 
   useEffect(() => {
     let cancelled = false;
-    let stop = null;
 
     load();
 
     if (typeof subscribeJob === 'function') {
-      stop = subscribeJob(id, (event) => {
+      streamRef.current = subscribeJob(id, (event) => {
         if (cancelled || !event) return;
         if (event.type === 'status') {
           setJob((prev) => (prev ? { ...prev, ...event.data } : prev));
@@ -49,17 +49,26 @@ export default function JobDetailPage() {
       });
     } else {
       const t = setInterval(load, 2000);
-      stop = () => clearInterval(t);
+      streamRef.current = () => clearInterval(t);
     }
 
     return () => {
       cancelled = true;
-      if (stop) stop();
+      if (streamRef.current) streamRef.current();
+      streamRef.current = null;
     };
   }, [id, load]);
 
+  // Once the job hits a terminal state, close the SSE/poll and do one final
+  // canonical fetch. Keeping the stream open past terminal burns an
+  // EventSource slot (browsers cap per-origin) and a server FD for no reason.
   useEffect(() => {
-    if (job?.status === 'completed' || job?.status === 'failed') {
+    const s = job?.status;
+    if (s === 'completed' || s === 'failed' || s === 'cancelled') {
+      if (streamRef.current) {
+        streamRef.current();
+        streamRef.current = null;
+      }
       load();
     }
   }, [job?.status, load]);

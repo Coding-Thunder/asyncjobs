@@ -65,8 +65,16 @@ All of the API's env vars are documented in [`apps/api/.env.example`](../apps/ap
 ```bash
 # HTTP
 PORT=4000
-# Comma-separated list of allowed origins. Leave unset in dev for permissive CORS.
-CORS_ORIGIN=https://app.asyncops.com,https://asyncops.com
+# Comma-separated allow-list of browser origins for CORS. In production,
+# unlisted origins are REJECTED (not silently permitted). In dev (NODE_ENV
+# unset or != 'production'), the default is http://localhost:3000.
+# ALLOWED_ORIGINS is the canonical name; CORS_ORIGIN is kept as a legacy alias.
+ALLOWED_ORIGINS=https://app.asyncops.com,https://asyncops.com
+
+# Set when the API is behind a reverse proxy / L7 load balancer so that
+# req.ip reflects the real client for rate limiting. Accepts an integer hop
+# count (e.g. `1`) or a recognized express value (`loopback`, IP, CIDR).
+TRUST_PROXY=1
 
 # MongoDB
 MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net
@@ -75,9 +83,15 @@ MONGODB_DB=asyncops
 # Redis
 REDIS_URL=rediss://default:pass@host:6379
 
-# Auth
+# Auth — JWT_SECRET is REQUIRED in production. If unset (or left as the dev
+# default "dev-secret-change-me"), the process exits 1 on boot so you can't
+# accidentally ship with a publicly-known signing key.
 JWT_SECRET=<long random string — ≥ 32 bytes of entropy>
 JWT_EXPIRES_IN=7d
+
+# Dashboard base URL — used to render the per-user email-verification link
+# that gets printed to stdout (see "Email verification" below).
+DASHBOARD_URL=https://app.asyncops.com
 
 # Queue tuning (all optional, shown with defaults)
 MAX_JOB_ATTEMPTS=3
@@ -89,8 +103,10 @@ QUEUE_NAME=asyncops-jobs      # must not contain ':' — BullMQ rejects those
 
 Notes worth knowing:
 
-- `CORS_ORIGIN` is **comma-separated**. With no value, the API uses permissive CORS — fine for dev, never for prod.
+- `ALLOWED_ORIGINS` (or legacy `CORS_ORIGIN`) is **comma-separated, exact-match**. In prod, any Origin not in the list is rejected — there is no wildcard mode. In dev the default is `http://localhost:3000`.
+- `JWT_SECRET` is **fail-fast** in prod. If `NODE_ENV=production` and the secret is unset or equals the dev default, `apps/api/auth.js` logs an error and calls `process.exit(1)`. This is deliberate — shipping the dev default signing key would let anyone forge tokens.
 - `JWT_SECRET` is read once at startup. Rotating it invalidates every JWT in the wild — users will need to log in again. API keys are unaffected by JWT rotation.
+- `TRUST_PROXY` is mandatory behind a reverse proxy. Without it, every request looks like the proxy's IP and the per-IP rate limit collapses into one bucket.
 - `JOB_LOCK_DURATION_MS` is the time between a worker dying silently and another worker re-claiming the job. Lower it for low-latency workloads, but be careful: slow-but-healthy handlers will be declared stalled if the lock is shorter than the real handler runtime.
 
 ### `apps/web/`
@@ -109,7 +125,7 @@ That's it. The dashboard is a Next.js app that calls the API from the browser, s
    - Root directory: `apps/api/`
    - Build command: `npm install`
    - Start command: `node index.js`
-   - Health check path: `GET /health` → `{ ok: true }`.
+   - Health check path: `GET /livez` → `{ ok: true }` (always-200 liveness). For a deeper "is this replica actually usable" check, probe `GET /readyz` — it pings Mongo and Redis and returns 503 when a dep is down, 200 otherwise. `GET /health` is kept as a 200 alias for back-compat.
    - Environment: everything listed above.
    - **Replicas: 1.** See "Critical constraint" above. Do not scale this out.
 4. **Deploy the dashboard (`apps/web/`).**
@@ -121,11 +137,11 @@ That's it. The dashboard is a Next.js app that calls the API from the browser, s
 5. **Point DNS.**
    - `api.<your-domain>` → API host
    - `app.<your-domain>` → dashboard host
-6. **Set `CORS_ORIGIN=https://app.<your-domain>`** on the API and redeploy.
+6. **Set `ALLOWED_ORIGINS=https://app.<your-domain>`** on the API and redeploy.
 
 ## First-boot smoke test
 
-1. `curl https://api.<your-domain>/health` → `{ "ok": true }`.
+1. `curl https://api.<your-domain>/livez` → `{ "ok": true }`, then `curl https://api.<your-domain>/readyz` → `{ "ok": true, "checks": { "mongo": true, "redis": true } }`. If `/readyz` returns 503, check the `checks` object to see which dep is down.
 2. Browse to `https://app.<your-domain>/signup`, create an account, log in.
 3. Go to **API Keys** → **Create key**, name it `smoke`, copy the `ak_live_…` value.
 4. On your laptop, run a worker:
@@ -161,6 +177,41 @@ That's it. The dashboard is a Next.js app that calls the API from the browser, s
 
 If any step fails, see [debugging.md](debugging.md) for the drill.
 
+## Email verification (no SMTP)
+
+AsyncOps does not ship email. The verification flow exists, but the operator has to deliver the link manually until an SMTP integration is funded. How it works today:
+
+1. A signed-in user calls `POST /auth/request-verify` (the dashboard exposes this as a "Send verification email" button).
+2. The API signs a short-lived JWT with `purpose: "email-verify"` and writes the full verification URL to **API stdout**, tagged `[auth]`:
+
+   ```text
+   [auth] email verification link for user@example.com: https://app.asyncops.com/verify-email?token=eyJhbGciOi... (AsyncOps does not send email — deliver this manually.)
+   ```
+
+3. The operator (that's you) pulls this line from your log aggregator and sends the URL to the user out-of-band — support ticket, chat, wherever.
+4. The user opens the URL; the dashboard `POST`s the token to `/auth/verify-email`, which flips `emailVerified: true` on the user doc.
+
+The URL hostname is taken from the `DASHBOARD_URL` env var (defaults to `http://localhost:3000` in dev). Make sure this matches the origin you published, or the link will 404.
+
+**Until SMTP is wired up, do not claim email verification in your product UX.** The dashboard copy already reflects this — the "Send verification" button is labeled accordingly. Email verification is not enforced anywhere: `emailVerified` is a field on the user doc, not a gate on signup or login.
+
+## Auth hygiene: case and whitespace
+
+Signup and login both normalize the `email` field (`trim().toLowerCase()` in [`authRoutes.js`](../apps/api/routes/authRoutes.js)). A user who signed up as `Alice@Example.com` can log in as `alice@example.com ` without surprise. The stored value is the normalized form, so existing dupes are not auto-merged — on a fresh deployment this is a non-issue; on an already-populated instance with mixed-case duplicates, merge them manually before enabling.
+
+## Rate limits
+
+The API ships with in-process rate limits via [`express-rate-limit`](https://www.npmjs.com/package/express-rate-limit). Storage is in-memory because AsyncOps is single-replica (see "Critical constraint" above) — if we ever scale horizontally the store needs to move to Redis via `rate-limit-redis`.
+
+| Surface | Limit | Key |
+|---|---|---|
+| `POST /auth/*` (signup, login, verify) | 20 requests per 60s | Per IP |
+| `POST /jobs` (create job) | 120 requests per 60s | Per authenticated user id, falling back to IP for unauthenticated requests |
+
+Both are disabled when `NODE_ENV=test` so the Jest suite can hammer endpoints without tripping caps. Tune by editing `apps/api/middleware/rateLimit.js` — there is no env-var knob today; if you need to change the ceiling, change the code and redeploy.
+
+**Behind a reverse proxy:** set `TRUST_PROXY` (see env vars above) or every request looks like the proxy IP and the per-IP limiter blocks all traffic together.
+
 ## Creating the first admin user
 
 The `role` field on `users` defaults to `'user'` ([`authRoutes.js:33`](../apps/api/routes/authRoutes.js#L33)). There is no self-service "make me admin" button. To grant the admin role, update the user document directly in Mongo after they've signed up:
@@ -185,7 +236,7 @@ Admin-gated routes live under `/admin`. Verify with a `GET /me` — the response
 
 ## Monitoring, at minimum
 
-- **`GET /health`** — black-box uptime on the API.
+- **`GET /livez`** — black-box uptime on the API. Pair it with **`GET /readyz`** if you want the probe to fail when Mongo or Redis is down (useful as a readiness gate in Kubernetes or a Render health check).
 - **Redis queue depth.** BullMQ exposes per-queue counts (`waiting`, `active`, `delayed`, `failed`) via its own APIs — scrape them and chart them. A growing `waiting` with low `active` means user workers aren't keeping up.
 - **Mongo insert rate** on `jobs` — matches your incoming job volume.
 - **End-to-end latency.** For completed jobs, `updatedAt - createdAt` approximates total time including retry backoff. Track p50 / p95.
@@ -205,7 +256,7 @@ Caveats worth knowing for production:
 ## Security
 
 - **Always require TLS.** `Authorization: Bearer ak_live_…` over plaintext would expose keys to any proxy in the path.
-- **`CORS_ORIGIN` must list exact dashboard origins** in production — no wildcards. The API reads it as a comma-separated list.
+- **`ALLOWED_ORIGINS` must list exact dashboard origins** in production — no wildcards. The API reads it (or the legacy `CORS_ORIGIN`) as a comma-separated list; unlisted origins are rejected, not permitted.
 - **API keys are bcrypt hashed** (not SHA-256) at [`apiKeyRoutes.js:34`](../apps/api/routes/apiKeyRoutes.js#L34) and verified via `bcrypt.compare` at [`auth.js:27`](../apps/api/auth.js#L27). The visible 8-character prefix after `ak_live_` is stored in cleartext and is used only to narrow the candidate set before the bcrypt compare — it is not itself a secret. Cost factor is 10.
 - **Per-request auth latency.** Because bcrypt is intentionally slow (~50-150 ms at cost 10 depending on hardware), each request authenticated with an API key pays that cost. For high-QPS workers this dominates; consider caching verified keys in-process for a short TTL if you ever need to.
 - **JWT rotation.** Rotating `JWT_SECRET` invalidates every existing JWT — all logged-in users will be kicked out on their next dashboard request. API keys are independent.

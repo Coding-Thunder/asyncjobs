@@ -3,8 +3,18 @@ const bcrypt = require('bcryptjs');
 const { ObjectId } = require('mongodb');
 const { getCollections } = require('./db');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const DEV_JWT_SECRET = 'dev-secret-change-me';
+const JWT_SECRET = process.env.JWT_SECRET || DEV_JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+
+if (process.env.NODE_ENV === 'production' && JWT_SECRET === DEV_JWT_SECRET) {
+  // eslint-disable-next-line no-console
+  console.error(
+    '[auth] JWT_SECRET is unset or set to the dev default in production. ' +
+      'Set JWT_SECRET to a long random string (>= 32 bytes of entropy) before boot.'
+  );
+  process.exit(1);
+}
 
 function signToken(user) {
   return jwt.sign(

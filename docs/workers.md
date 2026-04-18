@@ -104,13 +104,13 @@ async (job, ctx) => result
 | `job.type` | string | Matches a key in your `handlers` |
 | `job.data` | any JSON \| null | Exactly what was passed to `createJob` |
 | `job.status` | string | `"processing"` — that's the state you're looking at |
-| `job.attempts` | number | Attempt counter. Normally starts at `1` on first run, increments on every retry. In rare races it can be `0`; treat it as a **lower bound**, not a truth. |
+| `job.attempts` | number | Attempt counter. Starts at `1` on first run, increments on BullMQ-driven retries. Treat it as a **lower bound**, not a truth — in rare races it can briefly read `0`, and an explicit `POST /jobs/:id/retry` (dashboard button, SDK `retryJob()`, MCP `retry_job`) **resets it to `0`** so BullMQ gets a clean retry budget. |
 | `job.createdAt` | ISO timestamp | When `createJob` was called |
 | `job.updatedAt` | ISO timestamp | Last state change |
 
 ### What `ctx` gives you
 
-- `ctx.log(message: string)` — appends one log line to the job. Visible in the dashboard and on `client.subscribe()`. Fire-and-forget; it never throws inside your handler (any error appending the log is routed to `onError`). The log array is capped at 500 entries per job; older lines are silently dropped.
+- `ctx.log(message: string)` — appends one log line to the job. Visible in the dashboard and on `client.subscribe()`. Fire-and-forget; it never throws inside your handler (any error appending the log is routed to `onError`). The log array is capped at 500 entries per job; older lines are silently dropped. See [Log cap](#log-cap) below.
 
 That's the entire `ctx` surface. There is no `ctx.setProgress`, no `ctx.extend`, no `ctx.sleep`. Keep it simple.
 
@@ -182,6 +182,24 @@ onError: (err, ctx) => {
 ```
 
 The `handler` stage is special: the error **has already been reported to AsyncOps**. `onError` is just your chance to log it locally or page someone.
+
+## Log cap
+
+Each job retains the last **500** `ctx.log()` entries. Older lines are dropped silently inside Mongo via a `$slice` window — there is no truncation marker in the log stream, so a noisy handler that logs in a tight loop will fill its window and older lines will vanish.
+
+The API prints a single `console.warn` when a job first crosses the cap:
+
+```
+[jobs] log cap reached for job <id> — only the last 500 entries are retained; older logs are discarded. See docs/workers.md#log-cap.
+```
+
+The warning fires **once per job**; it does not repeat for subsequent writes on the same job. If you see this in API stdout, treat it as a pointer that the handler is over-logging, not as a per-log throttle.
+
+**What to do:**
+
+- Don't log inside tight loops. Batch or sample.
+- If you legitimately need more than 500 log lines (e.g. streaming progress of a 10k-row import), ship those lines to your own logging stack and only `ctx.log` the checkpoints.
+- Logs are a debugging aid, not a durable audit trail — treat them as such.
 
 ## Scaling out
 

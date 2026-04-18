@@ -54,21 +54,11 @@ describe('GET /me', () => {
 });
 
 describe('POST /upgrade', () => {
-  it('upgrades user plan to pro', async () => {
-    cols.users.updateOne.mockResolvedValueOnce({ matchedCount: 1 });
-    cols.users.findOne.mockResolvedValueOnce({
-      _id: userId,
-      email: 'test@example.com',
-      plan: 'pro',
-      jobCountMonthly: 5,
-    });
-
+  it('is removed — self-service upgrades are gone until billing is funded', async () => {
     const res = await request(app)
       .post('/upgrade')
       .set(authHeader());
 
-    expect(res.status).toBe(200);
-    expect(res.body.plan).toBe('pro');
-    expect(res.body.limit).toBe(50000);
+    expect(res.status).toBe(404);
   });
 });

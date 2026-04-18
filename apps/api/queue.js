@@ -76,12 +76,16 @@ async function enqueueJob(mongoJobId) {
   );
 }
 
+// Only flip a job to pending when its current status is non-terminal.
+// A worker that has already claimed (processing), completed, or had its job
+// cancelled must not be resurrected by a late BullMQ delivery. Returns true
+// when the doc was actually flipped.
 async function flipToPending(mongoJobIdStr, attemptNumber) {
   const { jobs } = await getCollections();
   const oid = new ObjectId(mongoJobIdStr);
   const now = new Date();
-  await jobs.updateOne(
-    { _id: oid },
+  const result = await jobs.updateOne(
+    { _id: oid, status: { $in: ['pending', 'processing', 'failed'] } },
     {
       $set: {
         status: 'pending',
@@ -91,10 +95,14 @@ async function flipToPending(mongoJobIdStr, attemptNumber) {
       },
     }
   );
+  if (result.matchedCount === 0) {
+    return false;
+  }
   publishEvent(mongoJobIdStr, {
     type: 'status',
     data: { status: 'pending', attempts: attemptNumber, updatedAt: now },
   });
+  return true;
 }
 
 async function markFailedTerminal(mongoJobIdStr, errMsg) {
@@ -120,7 +128,15 @@ function startProxyWorker() {
       const { mongoJobId } = bullJob.data;
       // attemptsMade is 0 on first run, 1 on first retry, etc.
       const attemptNumber = bullJob.attemptsMade + 1;
-      await flipToPending(mongoJobId, attemptNumber);
+      const flipped = await flipToPending(mongoJobId, attemptNumber);
+      if (!flipped) {
+        // Doc is in a terminal state (completed or cancelled) — drop the BullMQ
+        // job silently so it does not retry.
+        console.log(
+          `[queue] drop stale BullMQ job ${mongoJobId}: doc is terminal`
+        );
+        return null;
+      }
 
       return await new Promise((resolve, reject) => {
         pending.set(mongoJobId, { resolve, reject });
@@ -166,7 +182,17 @@ function startProxyWorker() {
 
 function signalComplete(mongoJobIdStr, result) {
   const entry = pending.get(mongoJobIdStr);
-  if (entry) entry.resolve(result ?? null);
+  if (entry) {
+    entry.resolve(result ?? null);
+    return;
+  }
+  // No in-memory entry: the BullMQ promise was dropped (e.g. API restart)
+  // and its lock will expire after JOB_LOCK_DURATION_MS. Surface it so the
+  // operator can see stalled jobs instead of silently no-oping.
+  console.warn(
+    `[queue] signalComplete: no pending BullMQ entry for ${mongoJobIdStr} ` +
+      `(API may have restarted; BullMQ lock will expire in up to JOB_LOCK_DURATION_MS)`
+  );
 }
 
 function signalFail(mongoJobIdStr, error) {
@@ -174,7 +200,12 @@ function signalFail(mongoJobIdStr, error) {
   if (entry) {
     const err = error instanceof Error ? error : new Error(String(error || 'failed'));
     entry.reject(err);
+    return;
   }
+  console.warn(
+    `[queue] signalFail: no pending BullMQ entry for ${mongoJobIdStr} ` +
+      `(API may have restarted; BullMQ lock will expire in up to JOB_LOCK_DURATION_MS)`
+  );
 }
 
 async function close() {
@@ -198,6 +229,7 @@ module.exports = {
   signalComplete,
   signalFail,
   close,
+  getRedisConnection: getConnection,
   REDIS_URL,
   MAX_ATTEMPTS,
 };

@@ -2,9 +2,11 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import { apiFetch, getToken } from '../../lib/api';
 import { LogoIcon } from '../../components/Logo';
+
+const CONTACT_EMAIL = 'hello@asyncops.com';
+const CONTACT_MAILTO = `mailto:${CONTACT_EMAIL}?subject=AsyncOps%20Pro%20upgrade`;
 
 const sharedFeatures = [
   'Dashboard with real-time SSE updates',
@@ -40,8 +42,8 @@ const tiers = [
       '50,000 jobs / month',
       ...sharedFeatures,
     ],
-    cta: 'Upgrade to Pro',
-    action: 'upgrade',
+    cta: 'Contact us',
+    action: 'contact',
     highlighted: true,
   },
 ];
@@ -99,34 +101,13 @@ const comparisonRows = [
 ];
 
 export default function PricingPage() {
-  const router = useRouter();
   const [me, setMe] = useState(null);
-  const [upgrading, setUpgrading] = useState(false);
-  const [justUpgraded, setJustUpgraded] = useState(false);
 
   useEffect(() => {
     const token = getToken();
     if (!token) return;
     apiFetch('/me').then(setMe).catch(() => {});
   }, []);
-
-  async function handleUpgrade() {
-    const token = getToken();
-    if (!token) {
-      router.push('/signup?next=/pricing');
-      return;
-    }
-    setUpgrading(true);
-    try {
-      const updated = await apiFetch('/upgrade', { method: 'POST' });
-      setMe((prev) => ({ ...(prev || {}), ...updated }));
-      setJustUpgraded(true);
-      setTimeout(() => router.push('/dashboard/jobs'), 900);
-    } catch {
-      setUpgrading(false);
-      router.push('/login?next=/pricing');
-    }
-  }
 
   const isLoggedIn = !!me;
   const currentPlan = me?.plan;
@@ -232,25 +213,22 @@ export default function PricingPage() {
                   ))}
                 </ul>
 
-                {tier.action === 'upgrade' ? (
-                  <button
-                    onClick={handleUpgrade}
-                    disabled={isCurrent || upgrading}
-                    className={
-                      'mt-8 w-full py-3 rounded-lg text-sm font-semibold transition-all duration-200 ' +
-                      (isCurrent
-                        ? 'bg-white/[0.04] border border-white/[0.08] text-zinc-500 cursor-not-allowed'
-                        : 'bg-white text-zinc-900 hover:bg-zinc-100 shadow-[0_0_40px_-10px_rgba(255,255,255,0.4)] hover:shadow-[0_0_50px_-8px_rgba(255,255,255,0.55)] hover:-translate-y-px disabled:opacity-60')
-                    }
-                  >
-                    {isCurrent
-                      ? '✓ You\'re on Pro'
-                      : justUpgraded
-                      ? '✓ Upgraded — redirecting'
-                      : upgrading
-                      ? 'Upgrading…'
-                      : tier.cta}
-                  </button>
+                {tier.action === 'contact' ? (
+                  isCurrent ? (
+                    <button
+                      disabled
+                      className="mt-8 w-full py-3 rounded-lg text-sm font-semibold bg-white/[0.04] border border-white/[0.08] text-zinc-500 cursor-not-allowed"
+                    >
+                      ✓ You&apos;re on Pro
+                    </button>
+                  ) : (
+                    <a
+                      href={CONTACT_MAILTO}
+                      className="mt-8 block w-full py-3 rounded-lg text-sm font-semibold text-center bg-white text-zinc-900 hover:bg-zinc-100 shadow-[0_0_40px_-10px_rgba(255,255,255,0.4)] hover:shadow-[0_0_50px_-8px_rgba(255,255,255,0.55)] hover:-translate-y-px transition-all duration-200"
+                    >
+                      {tier.cta}
+                    </a>
+                  )
                 ) : (
                   <Link
                     href={tier.href}
@@ -381,19 +359,28 @@ export default function PricingPage() {
               Stop grepping logs. Start trusting your background jobs. Upgrade anytime — your incidents won&apos;t wait for you to be ready.
             </p>
             <div className="mt-8 flex items-center justify-center gap-3">
-              <button
-                onClick={handleUpgrade}
-                disabled={upgrading || currentPlan === 'pro'}
-                className="px-6 py-3 rounded-lg text-sm font-semibold bg-white text-zinc-900 hover:bg-zinc-100 shadow-[0_0_40px_-10px_rgba(255,255,255,0.4)] transition-all duration-200 hover:-translate-y-px disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                {currentPlan === 'pro'
-                  ? '✓ You\'re on Pro'
-                  : upgrading
-                  ? 'Upgrading…'
-                  : isLoggedIn
-                  ? 'Upgrade to Pro'
-                  : 'Start free'}
-              </button>
+              {currentPlan === 'pro' ? (
+                <button
+                  disabled
+                  className="px-6 py-3 rounded-lg text-sm font-semibold bg-white/[0.04] border border-white/[0.08] text-zinc-500 cursor-not-allowed"
+                >
+                  ✓ You&apos;re on Pro
+                </button>
+              ) : isLoggedIn ? (
+                <a
+                  href={CONTACT_MAILTO}
+                  className="px-6 py-3 rounded-lg text-sm font-semibold bg-white text-zinc-900 hover:bg-zinc-100 shadow-[0_0_40px_-10px_rgba(255,255,255,0.4)] transition-all duration-200 hover:-translate-y-px"
+                >
+                  Contact us
+                </a>
+              ) : (
+                <Link
+                  href="/signup"
+                  className="px-6 py-3 rounded-lg text-sm font-semibold bg-white text-zinc-900 hover:bg-zinc-100 shadow-[0_0_40px_-10px_rgba(255,255,255,0.4)] transition-all duration-200 hover:-translate-y-px"
+                >
+                  Start free
+                </Link>
+              )}
               <Link
                 href="/docs"
                 className="px-6 py-3 rounded-lg text-sm font-semibold border border-white/[0.1] text-zinc-200 hover:bg-white/[0.05] hover:border-white/[0.2] transition-all duration-200"

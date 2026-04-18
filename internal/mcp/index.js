@@ -114,7 +114,12 @@ server.registerTool(
   {
     title: 'Retry a job',
     description:
-      'Re-queue a job for execution. Clears the previous result and error but keeps the original type and data.',
+      'Re-queue a terminal job (status "failed" or "completed") for execution. ' +
+      'Clears the previous result, error, and attempt counter but keeps the ' +
+      'original type and data. ' +
+      'Do NOT call retry_job on jobs in status "pending" or "processing" \u2014 ' +
+      'the server will respond 409 job_not_retriable. Retries count against ' +
+      'the monthly plan quota, same as create_job.',
     inputSchema: {
       jobId: z.string().describe('The job id to retry.'),
     },

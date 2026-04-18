@@ -27,26 +27,8 @@ router.get('/me', async (req, res, next) => {
   }
 });
 
-router.post('/upgrade', async (req, res, next) => {
-  try {
-    const { users } = await getCollections();
-    await users.updateOne(
-      { _id: req.user.id },
-      { $set: { plan: 'pro' } }
-    );
-
-    const plan = getPlan('pro');
-    const user = await users.findOne({ _id: req.user.id });
-
-    res.json({
-      email: user.email,
-      plan: 'pro',
-      jobCountMonthly: user.jobCountMonthly || 0,
-      limit: plan.monthlyJobLimit,
-    });
-  } catch (e) {
-    next(e);
-  }
-});
+// Public self-service plan upgrade is intentionally removed — AsyncOps has
+// no billing integration yet. Plans are admin-managed via
+// POST /admin/users/:id/plan. See docs/admin.md.
 
 module.exports = router;

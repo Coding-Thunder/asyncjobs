@@ -15,6 +15,7 @@ const { requireAuth } = require('../auth');
 const { addListener, removeListener, publishEvent } = require('../events');
 const { getPlan, ensureMonthlyReset } = require('../plans');
 const { enqueueJob, signalComplete, signalFail } = require('../queue');
+const { jobCreateLimiter } = require('../middleware/rateLimit');
 
 const router = express.Router();
 
@@ -51,13 +52,44 @@ async function appendLog(jobs, jobId, message) {
     message: String(message),
     timestamp: new Date(),
   };
-  await jobs.updateOne(
+  // $slice keeps only the tail — older logs are silently dropped past the
+  // cap. Track total-ever count via $inc so we can warn the operator once
+  // per job when truncation begins (otherwise lost stdout is invisible).
+  const updated = await jobs.findOneAndUpdate(
     { _id: jobId },
     {
       $push: { logs: { $each: [entry], $slice: -MAX_LOGS_PER_JOB } },
+      $inc: { logCount: 1 },
       $set: { updatedAt: entry.timestamp },
+    },
+    {
+      projection: { logCount: 1, logCapWarned: 1 },
+      returnDocument: 'after',
     }
   );
+  const doc = updated && (updated.value || updated);
+  if (
+    doc &&
+    doc.logCount > MAX_LOGS_PER_JOB &&
+    !doc.logCapWarned
+  ) {
+    jobs
+      .updateOne(
+        { _id: jobId, logCapWarned: { $exists: false } },
+        { $set: { logCapWarned: true } }
+      )
+      .then((r) => {
+        if (r.modifiedCount > 0) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[jobs] log cap reached for job ${jobId.toString()} — ` +
+              `only the last ${MAX_LOGS_PER_JOB} entries are retained; ` +
+              'older logs are discarded. See docs/workers.md#log-cap.'
+          );
+        }
+      })
+      .catch(() => {});
+  }
   publishEvent(jobId.toString(), { type: 'log', data: entry });
   return entry;
 }
@@ -84,7 +116,7 @@ function validateCreate(body) {
 }
 
 // ---------- Client: create job ----------
-router.post('/', async (req, res, next) => {
+router.post('/', jobCreateLimiter, async (req, res, next) => {
   try {
     const parsed = validateCreate(req.body);
     if (parsed.error) {
@@ -194,18 +226,63 @@ router.post('/', async (req, res, next) => {
 });
 
 // ---------- Client: list jobs ----------
+// Paginated descending by createdAt then _id. `cursor` is an opaque base64url
+// of `${createdAt.toISOString()}|${_id}` from the last row of the prior page.
+// `limit` clamps to [1, 100]; default 50.
+const JOBS_LIST_DEFAULT_LIMIT = 50;
+const JOBS_LIST_MAX_LIMIT = 100;
+
+function encodeCursor(createdAt, id) {
+  const raw = `${createdAt.toISOString()}|${id.toString()}`;
+  return Buffer.from(raw, 'utf8').toString('base64url');
+}
+
+function decodeCursor(raw) {
+  try {
+    const decoded = Buffer.from(String(raw), 'base64url').toString('utf8');
+    const [iso, idStr] = decoded.split('|');
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return null;
+    const oid = toObjectId(idStr);
+    if (!oid) return null;
+    return { createdAt: date, id: oid };
+  } catch {
+    return null;
+  }
+}
+
 router.get('/', async (req, res, next) => {
   try {
+    const parsedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(parsedLimit)
+      ? Math.max(1, Math.min(JOBS_LIST_MAX_LIMIT, parsedLimit))
+      : JOBS_LIST_DEFAULT_LIMIT;
+
+    const filter = { userId: req.user.id };
+    if (req.query.cursor) {
+      const cur = decodeCursor(req.query.cursor);
+      if (!cur) return res.status(400).json({ error: 'invalid cursor' });
+      filter.$or = [
+        { createdAt: { $lt: cur.createdAt } },
+        { createdAt: cur.createdAt, _id: { $lt: cur.id } },
+      ];
+    }
+
     const { jobs } = await getCollections();
     const list = await jobs
-      .find({ userId: req.user.id })
+      .find(filter)
       .project({ type: 1, status: 1, createdAt: 1, updatedAt: 1, attempts: 1 })
-      .sort({ createdAt: -1 })
-      .limit(200)
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit + 1)
       .toArray();
 
+    const hasMore = list.length > limit;
+    const page = hasMore ? list.slice(0, limit) : list;
+    const last = page[page.length - 1];
+    const nextCursor = hasMore && last ? encodeCursor(last.createdAt, last._id) : null;
+
     res.json({
-      jobs: list.map((j) => ({
+      jobs: page.map((j) => ({
         id: j._id.toString(),
         type: j.type,
         status: j.status,
@@ -213,6 +290,7 @@ router.get('/', async (req, res, next) => {
         createdAt: j.createdAt,
         updatedAt: j.updatedAt,
       })),
+      nextCursor,
     });
   } catch (e) {
     next(e);
@@ -404,34 +482,76 @@ router.post('/:id/logs', async (req, res, next) => {
 });
 
 // ---------- Client: manual retry ----------
+// Only retriable states are `failed` and `completed`. Enforced atomically so
+// two concurrent retry calls cannot both flip a processing/pending job.
+// Retries count against the monthly plan cap, matching the create path.
 router.post('/:id/retry', async (req, res, next) => {
   try {
     const oid = toObjectId(req.params.id);
     if (!oid) return res.status(400).json({ error: 'invalid job id' });
 
     const idStr = oid.toString();
-    const { jobs } = await getCollections();
+    const { users, jobs } = await getCollections();
+
+    const user = await users.findOne({ _id: req.user.id });
+    if (!user) return res.status(401).json({ error: 'user not found' });
+
+    await ensureMonthlyReset(users, user);
+    const plan = getPlan(user.plan);
+    if (user.jobCountMonthly >= plan.monthlyJobLimit) {
+      return res.status(429).json({
+        error: `Monthly limit reached (${plan.monthlyJobLimit}). Upgrade to Pro for more.`,
+      });
+    }
 
     const now = new Date();
-    const result = await jobs.updateOne(
-      { _id: oid, userId: req.user.id },
+    const updated = await jobs.findOneAndUpdate(
+      {
+        _id: oid,
+        userId: req.user.id,
+        status: { $in: ['failed', 'completed'] },
+      },
       {
         $set: {
           status: 'pending',
           error: null,
           result: null,
+          attempts: 0,
           updatedAt: now,
         },
-      }
+      },
+      { returnDocument: 'after' }
     );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ error: 'not found' });
+    const doc = updated && (updated.value || updated);
+    const matched = doc && doc._id;
+
+    if (!matched) {
+      const current = await jobs.findOne(
+        { _id: oid, userId: req.user.id },
+        { projection: { status: 1 } }
+      );
+      if (!current) return res.status(404).json({ error: 'not found' });
+      return res.status(409).json({
+        error: 'job_not_retriable',
+        status: current.status,
+      });
     }
+
+    await users.updateOne(
+      { _id: req.user.id },
+      { $inc: { jobCountMonthly: 1 } }
+    );
 
     publishEvent(idStr, {
       type: 'status',
-      data: { status: 'pending', error: null, result: null, updatedAt: now },
+      data: {
+        status: 'pending',
+        error: null,
+        result: null,
+        attempts: 0,
+        updatedAt: now,
+      },
     });
     await appendLog(jobs, oid, 'Job retry requested');
 

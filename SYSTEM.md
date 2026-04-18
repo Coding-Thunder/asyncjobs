@@ -35,11 +35,11 @@ user-operated worker process.
 - **User application** — calls the API (via SDK or raw HTTP) to create and
   query jobs.
 - **User worker process** — a long-running Node process that uses
-  `createWorker` from [packages/sdk/index.js](packages/sdk/index.js) to
+  `createWorker` from [sdk/index.js](sdk/index.js) to
   register handlers and poll `/jobs/next`. Every handler runs here, in the
   user's own process space.
 
-The SDK package is [packages/sdk/](packages/sdk/), published as
+The SDK package is [sdk/](sdk/), published as
 `asyncops-sdk`. It is the only dependency a user needs.
 
 ## 3. Job lifecycle
@@ -94,7 +94,7 @@ for a normal job:
 4. **Handler execution** — In the user's worker process, the SDK calls the
    registered handler as `handler(job, ctx)`, where `ctx.log(message)` posts
    to `POST /jobs/:id/logs`
-   ([sdk/index.js:340-362](packages/sdk/index.js#L340-L362)). The handler
+   ([sdk/index.js:340-362](sdk/index.js#L340-L362)). The handler
    runs inside `withTimeout(..., handlerTimeoutMs)`; default
    `handlerTimeoutMs` is 5 minutes.
 
@@ -152,7 +152,7 @@ promotes it to an `Authorization: Bearer` header
   them, spawn them, or have network access to them.
 - A worker is created via
   `createWorker({ apiKey, handlers, pollInterval?, idlePollInterval?, handlerTimeoutMs?, onError?, logger? })`
-  ([sdk/index.js:278](packages/sdk/index.js#L278)).
+  ([sdk/index.js:278](sdk/index.js#L278)).
 - `handlers` is a map `{ [jobType]: async (job, ctx) => result }`. The set
   of keys becomes the `types` query parameter on `GET /jobs/next`.
 - The worker loop:
@@ -173,7 +173,7 @@ promotes it to an `Authorization: Bearer` header
   `Authorization: Bearer`. They never connect to Redis or MongoDB.
 - `JobsClient.subscribe(jobId, cb)` uses native `EventSource` when
   `window` is defined; otherwise it falls back to polling `GET /jobs/:id`
-  every 2 seconds ([sdk/index.js:204-271](packages/sdk/index.js#L204-L271)).
+  every 2 seconds ([sdk/index.js:204-271](sdk/index.js#L204-L271)).
 
 ## 5. API responsibilities
 
@@ -288,7 +288,9 @@ From [queue.js](apps/api/queue.js), [db.js](apps/api/db.js),
 | `JWT_SECRET` | `dev-secret-change-me` | JWT signing secret |
 | `JWT_EXPIRES_IN` | `7d` | JWT TTL |
 | `PORT` | `4000` | API HTTP port |
-| `CORS_ORIGIN` | `*` (true) | Comma-separated allowed origins |
+| `ALLOWED_ORIGINS` (legacy: `CORS_ORIGIN`) | `http://localhost:3000` in dev; none in prod | Comma-separated exact-match allow-list; unlisted origins are rejected in prod |
+| `TRUST_PROXY` | unset | Forwarded-header trust level for `req.ip` (needed behind a reverse proxy so rate limits key correctly) |
+| `DASHBOARD_URL` | `http://localhost:3000` | Base URL the API uses to render the email-verification link it prints to stdout |
 
 ### 7.2 Known races and single-replica assumption
 
@@ -299,16 +301,27 @@ From [queue.js](apps/api/queue.js), [db.js](apps/api/db.js),
   processed the BullMQ message, so a job handled on another replica will
   re-run after the stalled-lease window; and SSE events published on one
   replica are never seen by clients connected to another.
-- **Proxy-vs-claim race.** `POST /jobs` inserts the Mongo doc as
-  `pending` and then calls `enqueueJob`. A worker poll that lands in the
-  window between insert and BullMQ delivery can claim, run, and complete
-  the job before the proxy's processor runs. At that point
-  `signalComplete` finds no entry in `pending` and is a no-op; the proxy
-  then calls `flipToPending`, which **unconditionally** overwrites the
-  doc back to `status: 'pending'`. BullMQ will then drive the job again
-  after the stalled-lease window. Handlers must be idempotent.
-  [queue.js:79-98](apps/api/queue.js#L79-L98),
-  [jobRoutes.js:137-183](apps/api/routes/jobRoutes.js#L137-L183).
+- **Proxy-vs-claim race — mitigated.** `POST /jobs` inserts the Mongo
+  doc as `pending` and then calls `enqueueJob`. A worker poll that lands
+  in the window between insert and BullMQ delivery can claim, run, and
+  complete the job before the proxy's processor runs. `flipToPending`
+  now guards this: it only sets `status: 'pending'` when the current
+  status is `pending`, `processing`, or `failed`. If the job is already
+  `completed` or `cancelled`, the update is a no-op and the processor
+  returns without throwing — BullMQ drops the late delivery instead of
+  resurrecting terminal jobs. `signalComplete`/`signalFail` log an
+  orphan warning when they arrive without a matching `pending` entry
+  (typically after an API restart). Handlers must still be idempotent
+  because BullMQ retries on legitimate stalls.
+  [queue.js](apps/api/queue.js), [jobRoutes.js](apps/api/routes/jobRoutes.js).
+- **API restart drops in-flight BullMQ promises.** Because the proxy's
+  `pending` promise map is in-process, every currently-awaiting job is
+  abandoned when the API process exits. On next boot, BullMQ's
+  stalled-lease path re-runs each such job after `JOB_LOCK_DURATION_MS`
+  (10 min default). External workers that already completed their
+  handler between restart and re-run will produce duplicate side
+  effects; this is the cost of single-replica durability and another
+  reason handlers must be idempotent.
 
 ### 7.3 Payload and validation limits
 
@@ -316,7 +329,7 @@ From [queue.js](apps/api/queue.js), [db.js](apps/api/db.js),
 - `type` must match `^[a-zA-Z0-9._:\-]{1,100}$`.
 - `data` must be JSON-serializable (`JSON.stringify` must not throw).
 - `logs` array is capped at 500 entries per job.
-- `GET /jobs` returns at most 200 jobs, sorted by `createdAt` desc.
+- `GET /jobs` is paginated: `limit` clamps to `[1, 100]` (default 50), `cursor` is an opaque base64url token from the previous page's `nextCursor`. Results are sorted `createdAt` desc, `_id` desc.
 - Plan limits: free=1000 jobs/month, pro=50000 jobs/month, reset at UTC
   month rollover.
 
@@ -356,6 +369,56 @@ From [queue.js](apps/api/queue.js), [db.js](apps/api/db.js),
 
 ## 9. Items flagged as unclear from code
 
+
+## 10. Product intent (for contributors and AI agents)
+
+AsyncOps is NOT a generic job queue.
+
+AsyncOps is a developer tool focused on:
+
+- debugging async workflows
+- tracking execution state
+- providing visibility and control
+
+---
+
+## 10 Priorities (in order)
+
+1. Correct execution model (worker-based)
+2. Clear developer experience (no confusion)
+3. Fast onboarding (user succeeds in <10 minutes)
+4. Reliable job lifecycle tracking
+5. Simple architecture (avoid overengineering)
+
+---
+
+###  11 Non-goals
+
+- Do NOT build a serverless execution platform
+- Do NOT execute user code inside AsyncOps
+- Do NOT support multiple execution models (webhook + worker)
+- Do NOT overengineer scheduling, cron, or distributed systems
+
+---
+
+###  12 Key UX constraints
+
+- A user must understand:
+  "I need to run a worker"
+  within the first minute
+
+- A user must not be able to:
+  create a job and see nothing happen without explanation
+
+---
+
+### 13 Definition of done
+
+A feature is complete only if:
+
+- it aligns with the worker-based execution model
+- it does not confuse the user about who executes jobs
+- it improves clarity, not complexity
 None. Every statement above is backed by a specific file reference. If
 anything is later found to diverge from code, update this document
 rather than the code comments.

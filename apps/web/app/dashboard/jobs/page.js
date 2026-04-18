@@ -14,6 +14,11 @@ const STATUS_LABEL = {
   failed: 'failed',
 };
 const STALE_PENDING_MS = 15_000;
+// Default SDK `handlerTimeoutMs` is 5 min. A job stuck in `processing` past
+// 2x that almost always means the worker crashed or was SIGKILL'd after the
+// claim but before reporting success/failure. Flagging these in the UI lets
+// the user notice without tailing server logs.
+const STALLED_PROCESSING_MS = 10 * 60 * 1000;
 const STATUS_COLOR = {
   pending: 'text-zinc-400',
   processing: 'text-sky-400',
@@ -28,7 +33,14 @@ const STATUS_DOT = {
 };
 
 export default function JobsPage() {
-  const [jobs, setJobs] = useState([]);
+  // The list is split in two: `headJobs` is the first page (the newest jobs),
+  // refreshed by the 2s poll. `tailJobs` holds older pages loaded on demand
+  // via "load older" — the poll never touches them, so they stay stable until
+  // the user navigates away. On render we merge and dedupe by id.
+  const [headJobs, setHeadJobs] = useState([]);
+  const [tailJobs, setTailJobs] = useState([]);
+  const [nextCursor, setNextCursor] = useState(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [err, setErr] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   const [typeFilter, setTypeFilter] = useState('all');
@@ -40,13 +52,40 @@ export default function JobsPage() {
   const load = useCallback(async () => {
     try {
       const data = await apiFetch('/jobs');
-      setJobs(data.jobs || []);
+      setHeadJobs(data.jobs || []);
+      setNextCursor(data.nextCursor || null);
       setLastSynced(new Date());
       setErr('');
     } catch (e) {
       setErr(e.message);
     }
   }, []);
+
+  async function loadOlder() {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const data = await apiFetch(`/jobs?cursor=${encodeURIComponent(nextCursor)}`);
+      setTailJobs((prev) => [...prev, ...(data.jobs || [])]);
+      setNextCursor(data.nextCursor || null);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  const jobs = useMemo(() => {
+    const seen = new Set();
+    const out = [];
+    for (const j of headJobs) {
+      if (!seen.has(j.id)) { seen.add(j.id); out.push(j); }
+    }
+    for (const j of tailJobs) {
+      if (!seen.has(j.id)) { seen.add(j.id); out.push(j); }
+    }
+    return out;
+  }, [headJobs, tailJobs]);
 
   useEffect(() => {
     load();
@@ -111,9 +150,34 @@ export default function JobsPage() {
     setBulkBusy(true);
     try {
       const ids = Array.from(selected);
-      for (const id of ids) {
-        await apiFetch(`/jobs/${id}/retry`, { method: 'POST' });
+      const byId = new Map(jobs.map((j) => [j.id, j]));
+      const retriable = ids.filter((id) => {
+        const job = byId.get(id);
+        return job && (job.status === 'failed' || job.status === 'completed');
+      });
+      const skipped = ids.length - retriable.length;
+
+      const conflicts = [];
+      let retried = 0;
+      for (const id of retriable) {
+        try {
+          await apiFetch(`/jobs/${id}/retry`, { method: 'POST' });
+          retried += 1;
+        } catch (e) {
+          if (e.status === 409) {
+            conflicts.push({ id, message: e.message });
+          } else {
+            throw e;
+          }
+        }
       }
+
+      const parts = [];
+      if (retried > 0) parts.push(`retried ${retried}`);
+      if (skipped > 0) parts.push(`skipped ${skipped} (processing or pending)`);
+      if (conflicts.length > 0) parts.push(`${conflicts.length} rejected by server`);
+      setErr(parts.length > 0 ? parts.join(' · ') : '');
+
       setSelected(new Set());
       await load();
     } catch (e) {
@@ -346,7 +410,17 @@ export default function JobsPage() {
                 </Link>
               </div>
               <div className="font-mono text-xs text-zinc-400">{job.type}</div>
-              <div><StatusBadge status={job.status} /></div>
+              <div className="flex items-center gap-1.5">
+                <StatusBadge status={job.status} />
+                {isStalled(job) && (
+                  <span
+                    className="font-mono text-[10px] px-1.5 py-0.5 rounded border border-amber-500/30 text-amber-300 bg-amber-500/5"
+                    title="Processing for >10 min \u2014 the worker likely crashed mid-handler. Retry after verifying the worker is up."
+                  >
+                    stalled
+                  </span>
+                )}
+              </div>
               <div className="font-mono text-xs text-zinc-600 tabular-nums">
                 {timeAgo(new Date(job.createdAt))}
               </div>
@@ -365,6 +439,18 @@ export default function JobsPage() {
             </div>
           ))}
         </div>
+
+        {nextCursor && (
+          <div className="border-t border-white/[0.04] px-4 py-3 text-center">
+            <button
+              onClick={loadOlder}
+              disabled={loadingMore}
+              className="term-btn-ghost text-xs"
+            >
+              {loadingMore ? 'loading…' : '$ load older jobs'}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -439,6 +525,13 @@ function GuideStep({ num, title, subtitle, code }) {
       </pre>
     </div>
   );
+}
+
+function isStalled(job) {
+  if (!job || job.status !== 'processing') return false;
+  const t = new Date(job.updatedAt).getTime();
+  if (!Number.isFinite(t)) return false;
+  return Date.now() - t > STALLED_PROCESSING_MS;
 }
 
 function timeAgo(date) {

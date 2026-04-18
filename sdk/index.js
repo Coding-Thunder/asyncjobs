@@ -86,6 +86,7 @@ class JobsClient {
   async _request(path, options = {}) {
     const { auth = true, ...rest } = options;
     if (auth) this._assertAuth();
+    const method = options.method || 'GET';
     const res = await fetch(`${this.baseUrl}${path}`, {
       ...rest,
       headers: {
@@ -94,18 +95,31 @@ class JobsClient {
         ...(rest.headers || {}),
       },
     });
+
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    const isJson = contentType.includes('application/json');
+
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       let parsed;
-      try {
-        parsed = JSON.parse(text);
-      } catch {}
-      const msg = (parsed && parsed.error) || text || `HTTP ${res.status}`;
-      const err = new Error(`AsyncOps ${options.method || 'GET'} ${path}: ${msg}`);
+      if (isJson && text) {
+        try { parsed = JSON.parse(text); } catch {}
+      }
+      const snippet = text ? text.slice(0, 200) : '';
+      const msg = (parsed && parsed.error) || snippet || `HTTP ${res.status}`;
+      const err = new Error(`AsyncOps ${method} ${path}: ${msg}`);
       err.status = res.status;
+      err.body = text;
+      if (parsed && typeof parsed === 'object') err.data = parsed;
       throw err;
     }
+
     if (res.status === 204) return null;
+    if (!isJson) {
+      // Server returned a 2xx with HTML or empty body — don't JSON.parse
+      // blindly. Return the text so callers can decide what to do.
+      return (await res.text()) || null;
+    }
     return res.json();
   }
 
@@ -154,8 +168,12 @@ class JobsClient {
     });
   }
 
-  listJobs() {
-    return this._request('/jobs');
+  listJobs({ limit, cursor } = {}) {
+    const qs = [];
+    if (limit != null) qs.push(`limit=${encodeURIComponent(limit)}`);
+    if (cursor) qs.push(`cursor=${encodeURIComponent(cursor)}`);
+    const path = qs.length > 0 ? `/jobs?${qs.join('&')}` : '/jobs';
+    return this._request(path);
   }
 
   getJob(jobId) {
@@ -201,6 +219,13 @@ class JobsClient {
   }
 
   // ---- Realtime subscription (browser + Node) ----
+  //
+  // Browser path: native EventSource over GET /jobs/:id/stream (SSE).
+  // Node path:    HTTPS poll GET /jobs/:id every 2 s and diff on
+  //               job.status + logs.length. There is no EventSource
+  //               polyfill bundled — pulling one in for the minority
+  //               case is not worth the dep. See docs/sdk.md and
+  //               docs/workers.md for the caveats on the Node fallback.
   subscribe(jobId, callback) {
     let unsubscribed = false;
     let es = null;
@@ -229,11 +254,12 @@ class JobsClient {
       tick();
     };
 
+    const hasWindow = typeof window !== 'undefined';
     const ES =
       (typeof globalThis !== 'undefined' && globalThis.EventSource) ||
       (typeof EventSource !== 'undefined' ? EventSource : undefined);
 
-    if (ES && typeof window !== 'undefined') {
+    if (ES && hasWindow) {
       const url = `${this.baseUrl}/jobs/${encodeURIComponent(
         jobId
       )}/stream?token=${encodeURIComponent(this.token || '')}`;
@@ -260,6 +286,7 @@ class JobsClient {
         startPolling();
       }
     } else {
+      // Node (no window): poll. Zero new dependencies.
       startPolling();
     }
 
