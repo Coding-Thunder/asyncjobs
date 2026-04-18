@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { apiFetch, saveAuth } from '../../lib/api';
@@ -21,6 +21,14 @@ const BOOT_LINES = [
 ];
 
 export default function LoginPage() {
+  return (
+    <Suspense fallback={<TerminalAuthLayout bootLines={BOOT_LINES} />}>
+      <LoginPageInner />
+    </Suspense>
+  );
+}
+
+function LoginPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const nextPath = useMemo(
