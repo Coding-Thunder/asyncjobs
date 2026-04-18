@@ -1,6 +1,6 @@
 {
   "name": "asyncops-sdk",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Official SDK for AsyncOps — create jobs and run workers against the hosted AsyncOps API.",
   "main": "index.js",
   "files": [
